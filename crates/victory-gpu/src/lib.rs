@@ -27,6 +27,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 #[cfg(windows)]
+mod flip;
+#[cfg(windows)]
 mod fps;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
