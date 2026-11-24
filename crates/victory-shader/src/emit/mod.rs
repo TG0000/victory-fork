@@ -810,6 +810,35 @@ mod tests {
     use super::parse_loop_limit;
 
     #[test]
+    fn a_signature_row_has_one_interpolation_mode() {
+        let e = |kind, comp, interp, usage| super::container::SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(1),
+            col: 0,
+            cols: 1,
+            usage,
+            half: false,
+        };
+        let modes = |els: &[super::container::SigElement]| els.iter().map(|e| e.interp).collect::<Vec<_>>();
+        // A pixel input nothing reads beside an integer; one that is read keeps its mode.
+        let mut els = [e(0, 5, 1, 1), e(0, 9, 2, 0), e(0, 9, 2, 1)];
+        super::harmonize_row_interp(&mut els, false);
+        assert_eq!(modes(&els), [1, 1, 2]);
+        // ... beside one read flat.
+        let mut els = [e(0, 9, 2, 0), e(0, 9, 1, 1)];
+        super::harmonize_row_interp(&mut els, false);
+        assert_eq!(modes(&els), [1, 1]);
+        // An output row, whole.
+        let mut els = [e(0, 5, 1, 1), e(0, 9, 2, 1)];
+        super::harmonize_row_interp(&mut els, true);
+        assert_eq!(modes(&els), [1, 1]);
+    }
+
+    #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let all = super::bitcode::opt::ALL;
         assert_eq!(parse_shader_opt(None), all);

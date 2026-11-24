@@ -11653,6 +11653,95 @@ mod tests {
         }
     }
 
+    /// A 2D texture and a raw UAV in the view table at s0, a root constant at s1.
+    fn table_and_constant() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        (vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)], used)
+    }
+
+    fn validate_lowered(l: &Lowered) {
+        let dll = super::super::validator::Validator::default_path();
+        if let Ok(mut v) = super::super::validator::Validator::load(dll.as_deref()) {
+            v.validate(&mut l.dxil.clone()).expect("DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn immediate_samplers_chosen_by_control_flow_sample_once_each() {
+        let words = |other: u32| {
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF84_0003, // s_cbranch_scc0 -> other
+                0xBE88_03FF,
+                0x0000_0092, // s_mov_b32 s8, 0x92
+                0xBF82_0002, // s_branch -> join
+                0xBE88_03FF,
+                other,       // other: s_mov_b32 s8, other
+                0x7E04_02F0, // join: v_mov_b32 v2, 0.5
+                0x7E06_02F0, // v_mov_b32 v3, 0.5
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF09C_0F08,
+                0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+                0xE070_1000,
+                0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+                S_ENDPGM,
+            ]
+        };
+        for (other, samplers) in [(0x0000_0000, 2), (0x0000_0092, 1)] {
+            let (layout, used) = table_and_constant();
+            let l = lower_with(&words(other), layout, used).unwrap();
+            assert_eq!(l.samplers.len(), samplers);
+            validate_lowered(&l);
+        }
+    }
+
+    #[test]
+    fn the_size_of_an_image_nothing_else_reads() {
+        // (width, height) >> base level of the image at entry 0, added and stored.
+        let words = |third: u32| {
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xF40C_0502,
+                0xFA00_0000, // s_load_dwordx8 s[20:27], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x900C_9E15, // s_lshr_b32 s12, s21, 30
+                0x8F0E_8216, // s_lshl_b32 s14, s22, 2
+                0x9390_FF16,
+                0x0010_000E, // s_bfe_u32 s16, s22, 0x10000e
+                0x9391_FF17,
+                0x0004_000C, // s_bfe_u32 s17, s23, 0x4000c
+                third,       // s_or_b32 s12, s12, s14 (or a read of another dword)
+                0x800C_100C, // s_add_u32 s12, s12, s16
+                0x800C_110C, // s_add_u32 s12, s12, s17
+                0x7E18_020C, // v_mov_b32 v12, s12
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0xE070_1000,
+                0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+                S_ENDPGM,
+            ]
+        };
+        let (layout, used) = table_and_constant();
+        let l = lower_with(&words(0x880C_0E0C), layout, used).unwrap();
+        validate_lowered(&l);
+        // Another dword read too (s_or_b32 s12, s12, s24: the fourth): not a size alone.
+        let (layout, used) = table_and_constant();
+        assert!(lower_with(&words(0x880C_180C), layout, used).is_err());
+    }
+
     #[test]
     fn scalar_bit_tests_lower() {
         // Each tests one bit of a constant into SCC and branches on it (only
