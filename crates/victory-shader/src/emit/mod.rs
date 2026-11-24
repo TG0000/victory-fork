@@ -297,6 +297,35 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// DXIL wants one interpolation mode for all the elements of a signature
+/// row. Integer attributes and `SV_IsFrontFace` can only be constant, so the
+/// elements of their row nothing reads are too; a pixel input nothing reads
+/// otherwise takes the mode of the one of its row that is read (after the
+/// lowering has found it). `outputs`: a vertex or mesh stage's, where the mode
+/// means nothing (the pixel stage's inputs say how an attribute is
+/// interpolated), so the whole row takes it.
+/// (Pixel inputs: VIctory #306, wrothgaril.)
+pub(super) fn harmonize_row_interp(elements: &mut [container::SigElement], outputs: bool) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let here = |e: &container::SigElement| e.row == Some(row) && e.interp != 0;
+        let constant = elements.iter().any(|e| here(e) && (e.kind == 13 || (e.kind == 0 && e.comp != 9)));
+        let mode = if constant {
+            Some(1)
+        } else {
+            elements.iter().find(|e| here(e) && e.usage != 0).map(|e| e.interp)
+        };
+        let Some(m) = mode else { continue };
+        for e in elements.iter_mut() {
+            if here(e) && (outputs || e.usage == 0) {
+                e.interp = m;
+            }
+        }
+    }
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -580,7 +609,7 @@ fn emit_program(
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -593,6 +622,7 @@ fn emit_program(
             _ => 0,
         };
     }
+    harmonize_row_interp(interpolated, !pixel);
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
