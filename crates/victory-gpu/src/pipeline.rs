@@ -126,6 +126,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address
+    /// ([`stores_by_address`]); true when its code is not known.
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -184,6 +187,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(|p| stores_by_address(&p.code));
     let used = programs
         .into_iter()
         .find(|p| {
@@ -194,7 +198,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        stores_by_address,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -338,6 +347,26 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// Whether a console program can store through a raw address: a flat or
+/// global store or atomic, or code that is not all known. Of the translated
+/// programs only these write the copies of title memory by address
+/// (`Lower::memory_flat`; scalar loads and ray tests only read them), so
+/// the others do not declare every such copy written: a trace program that
+/// stores its result through a descriptor did, and the bytes of all copies
+/// were kept and compared after each of its submissions.
+#[cfg(windows)]
+fn stores_by_address(code: &[u8]) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(code) else {
+        return true;
+    };
+    code.iter().any(|i| match i.encoding {
+        Encoding::Flat | Encoding::Global => i.name().is_none_or(|n| !n.contains("_load_")),
+        Encoding::Sop1 => i.name().is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+        _ => false,
     })
 }
 
@@ -739,6 +768,24 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Only a flat or global store or atomic writes title memory by
+    /// address; code that is not known counts as one that does.
+    #[cfg(windows)]
+    #[test]
+    fn only_global_stores_write_by_address() {
+        let code = |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let end = 0xbf81_0000u32; // s_endpgm
+        let global = |op: u32| [0xdc00_8000 | op << 18, 0x007d_0000, end];
+        assert!(!stores_by_address(&code(&[end])));
+        assert!(!stores_by_address(&code(&global(0x0c)))); // global_load_dword
+        assert!(stores_by_address(&code(&global(0x1c)))); // global_store_dword
+        assert!(stores_by_address(&code(&global(0x32)))); // global_atomic_add
+        // buffer_store_dword v0, s[0:3]: through a descriptor.
+        assert!(!stores_by_address(&code(&[0xe070_0000, 0x8000_0000, end])));
+        // s_setpc_b64 s[0:1]: code elsewhere.
+        assert!(stores_by_address(&code(&[0xbe80_2000, end])));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

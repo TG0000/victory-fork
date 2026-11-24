@@ -2736,6 +2736,34 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// The bytes of a window [`find_page`] makes.
+pub(crate) const FINE: u64 = 256 << 10;
+
+/// The copy of the 64 KiB page at `address`, for shaders that reach it
+/// through a raw address (`memory.rs`): a buffer's, or a window that is
+/// there already, and else a window of [`FINE`] bytes, not the whole 4 MiB:
+/// such pages lie scattered over the title's structures, and two frames of
+/// them made 900 windows (3.5 GB of the PC's memory). The caller keeps the
+/// copy it was given for the page.
+pub(crate) fn find_page(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len)?;
+    let in_buffer = buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .any(|(_, e)| e.end >= end);
+    if in_buffer {
+        return lookup(address, len, false);
+    }
+    let there = {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let (cell, _) = window_of(address, end, WINDOW);
+        let keys = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        holder(keys, address, end).and_then(|key| map.get(&key).cloned())
+    };
+    there.or_else(|| loose_on(address, end, false, false, FINE))
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
@@ -2974,9 +3002,14 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    loose_on(address, end, unsized_ask, any, window())
+}
+
+/// As [`loose`], with the windows of asks with a length cut on `grid`.
+fn loose_on(address: u64, end: u64, unsized_ask: bool, any: bool, grid: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let named = window_of(address, end, if unsized_ask { WINDOW } else { grid });
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -3049,7 +3082,21 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{FINE, WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+
+    /// The window made for a page shaders ask for holds the page and is a
+    /// sixteenth of a cell; one that holds the page already is taken.
+    #[test]
+    fn a_page_gets_a_fine_window() {
+        let page = 0xd_1234_0000u64;
+        let end = page + 0x1_0000;
+        assert_eq!(window_of(page, end, FINE), (0xd_1234_0000, FINE));
+        assert_eq!(window_of(page + 0x3_0000, end + 0x3_0000, FINE), (0xd_1234_0000, FINE));
+        assert_eq!(FINE * 16, WINDOW);
+        let cell = page & !(WINDOW - 1);
+        assert_eq!(holder([(cell, WINDOW)].into_iter(), page, end), Some((cell, WINDOW)));
+        assert_eq!(holder([(page + FINE, FINE)].into_iter(), page, end), None);
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.

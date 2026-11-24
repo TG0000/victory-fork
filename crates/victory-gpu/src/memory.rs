@@ -38,8 +38,8 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
+//! there are at most [`COPIES`] of them (4 MiB windows for what a dispatch
+//! names, [`crate::shadow::FINE`] bytes for a page found empty). Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
@@ -56,11 +56,15 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+const COPIES: u32 = 4095;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+/// Title addresses shaders reach begin here: what the process has below is
+/// the host's (a null or small pointer is a page of it: a first run of the
+/// whole builder made a copy of 0x10000).
+const LOWEST: u64 = 1 << 32;
 
 struct Memory {
     /// Buffer, its mapping, its GPU address.
@@ -115,11 +119,12 @@ impl Memory {
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's: the copy a root view there gets (`named`), or one no
+    /// bigger than a page needs.
+    fn map(&mut self, address: u64, named: bool) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
-        if page >= u64::from(MEMORY_PAGES) - 1 {
+        if page >= u64::from(MEMORY_PAGES) - 1 || address < LOWEST {
             return;
         }
         // SAFETY: inside the directory's mapping.
@@ -141,10 +146,13 @@ impl Memory {
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
-            .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
+        let found = match named {
+            true => crate::shadow::find(start, 1)
+                .filter(whole)
+                .or_else(|| crate::shadow::find(start, PAGE).filter(whole)),
+            false => crate::shadow::find_page(start, PAGE).filter(whole),
+        };
+        let Some(shadow) = found else {
             return;
         };
         // SAFETY: a live buffer.
@@ -220,16 +228,28 @@ impl Memory {
                 );
             }
         }
+        let (asked, before) = (pages.len(), self.copies.len());
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            self.map(u64::from(page) * PAGE, false);
+        }
+        if asked > 0 {
+            let bytes: u64 = self.copies.iter().map(|c| c.span().1).sum();
+            tracing::info!(
+                pages = asked,
+                made = self.copies.len() - before,
+                copies = self.copies.len(),
+                mb = bytes >> 20,
+                refused = self.refused.len(),
+                "title memory by address: copies for the pages shaders found empty"
+            );
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+        self.map(address, true);
+        self.map((address & !(CELL - 1)) + CELL, true);
     }
 }
 
