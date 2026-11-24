@@ -74,6 +74,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style) = screen_style(parent, width, ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -100,6 +101,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style) = screen_style(parent, width, ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -116,6 +118,9 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    if parent.is_null() && big(width) && let Some(s) = screen() {
+        return (s.left, s.top, s.right - s.left, s.bottom - s.top);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -148,6 +153,83 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+/// A width the title's main window has, not a helper window's.
+fn big(width: i32) -> bool {
+    width >= 640 || width == wm::CW_USEDEFAULT
+}
+
+/// The screen the title's window covers, borderless and without taking the
+/// focus: the one Windows calls `DISPLAY<n>` with `VICTORY_MONITOR=<n>`.
+/// `None` if unset or there is no such screen.
+fn screen() -> Option<RECT> {
+    use windows_sys::Win32::Graphics::Gdi as gdi;
+
+    struct Search {
+        name: Vec<u16>,
+        found: Option<RECT>,
+    }
+    unsafe extern "system" fn visit(
+        monitor: gdi::HMONITOR,
+        _: gdi::HDC,
+        _: *mut RECT,
+        search: LPARAM,
+    ) -> i32 {
+        // SAFETY: plain data, for which zero is a value.
+        let mut info: gdi::MONITORINFOEXW = unsafe { std::mem::zeroed() };
+        info.monitorInfo.cbSize = size_of::<gdi::MONITORINFOEXW>() as u32;
+        // SAFETY: a monitor of the enumeration, a structure of the size it
+        // says, and the search below, which outlives the enumeration.
+        unsafe {
+            let search = &mut *(search as *mut Search);
+            if gdi::GetMonitorInfoW(monitor, (&raw mut info).cast()) != 0
+                && info.szDevice.starts_with(&search.name)
+            {
+                search.found = Some(info.monitorInfo.rcMonitor);
+                return 0;
+            }
+        }
+        1
+    }
+
+    static SCREEN: std::sync::OnceLock<Option<[i32; 4]>> = std::sync::OnceLock::new();
+    let [left, top, right, bottom] = (*SCREEN.get_or_init(|| {
+        let n: u32 = std::env::var("VICTORY_MONITOR").ok()?.trim().parse().ok()?;
+        let name = format!(r"\\.\DISPLAY{n}");
+        let name = name.encode_utf16().chain([0]).collect();
+        let mut search = Search { name, found: None };
+        // SAFETY: the callback only uses `search`, which outlives the call.
+        unsafe {
+            gdi::EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                Some(visit),
+                &raw mut search as LPARAM,
+            );
+        }
+        match search.found {
+            Some(r) => {
+                tracing::info!(n, x = r.left, y = r.top, w = r.right - r.left, h = r.bottom - r.top, "title window covers one screen");
+                Some([r.left, r.top, r.right, r.bottom])
+            }
+            None => {
+                tracing::warn!(n, "no such screen");
+                None
+            }
+        }
+    }))?;
+    Some(RECT { left, top, right, bottom })
+}
+
+/// The styles of a title window, borderless and never activated if it
+/// covers a screen.
+fn screen_style(parent: HWND, width: i32, ex_style: u32, style: u32) -> (u32, u32) {
+    if !parent.is_null() || !big(width) || screen().is_none() {
+        return (ex_style, style);
+    }
+    let frame = wm::WS_OVERLAPPEDWINDOW | wm::WS_MAXIMIZE | wm::WS_MINIMIZE;
+    (ex_style | wm::WS_EX_NOACTIVATE, (style & !frame) | wm::WS_POPUP)
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -168,6 +250,19 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Whatever the title asks for later, its window stays on its screen and
+    // does not take the focus.
+    if message == wm::WM_WINDOWPOSCHANGING
+        && let Some(s) = screen()
+    {
+        // SAFETY: the message's parameter is this structure.
+        let at = unsafe { &mut *(lparam as *mut wm::WINDOWPOS) };
+        if at.flags & wm::SWP_NOSIZE != 0 || big(at.cx) {
+            (at.x, at.y) = (s.left, s.top);
+            (at.cx, at.cy) = (s.right - s.left, s.bottom - s.top);
+            at.flags |= wm::SWP_NOACTIVATE;
+        }
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {

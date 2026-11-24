@@ -5610,6 +5610,8 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The frame rate on the picture, when `VICTORY_FPS` asks for it.
+    fps: crate::fps::Overlay,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -5732,6 +5734,9 @@ impl Meter {
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
+        crate::fps::set(format!(
+            "{fps:.1} FPS  {ms:.0} MS  {draws:.0} DRAWS  {dropped:.0} DROPPED"
+        ));
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -5944,6 +5949,7 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            p.fps.record(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -6022,6 +6028,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                fps: Default::default(),
             })
         }
     }
