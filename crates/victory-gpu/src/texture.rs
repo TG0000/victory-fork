@@ -392,16 +392,26 @@ impl Drop for Staging {
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // Lists that recorded an upload held it until they were reset, so
-        // the card is done with the buffer.
+        // the card is done with the buffer; behind any submission running
+        // now all the same, as what frees host copies does.
         if pool() {
-            let buffer = (self.buffer.clone(), self.data as usize);
-            let went = SPARE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .give_for(buffer, self.bytes, SPARE_MOST);
-            // Freed outside the lock.
-            drop(went);
+            crate::host::retire(Unused(self.buffer.clone(), self.data as usize, self.bytes));
         }
+    }
+}
+
+/// A staging buffer, its mapping and bytes, that goes to [`SPARE`] when it
+/// is dropped.
+struct Unused(ID3D12Resource, usize, u64);
+
+impl Drop for Unused {
+    fn drop(&mut self) {
+        let went = SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give_for((self.0.clone(), self.1), self.2, SPARE_MOST);
+        // Freed outside the lock.
+        drop(went);
     }
 }
 
