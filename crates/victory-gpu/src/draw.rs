@@ -324,6 +324,42 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds of those passes by part ([`HeapPart`]).
+pub(crate) static HEAP_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// What else a pass did: buffer slots looked at, passes over all of them,
+/// picked views kept, spans, texture slots looked at, textures brought up to
+/// date, and passes the time allowed for textures ran out in.
+pub(crate) static HEAP_COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The parts of a pass over the heap ([`State::heap_buffers`]), as
+/// [`HEAP_PARTS`] counts them.
+#[derive(Clone, Copy)]
+enum HeapPart {
+    /// Waiting for the kept ranges' lock, and asking which slots changed.
+    Slots,
+    /// Making the host views of the buffer slots.
+    Views,
+    /// Finding the host copies they show.
+    Copies,
+    Spans,
+    /// Bringing the copies up to date.
+    Refresh,
+    /// Which texture slots are due.
+    Due,
+    /// How much of a texture's memory is mapped.
+    Mapped,
+    /// Host textures and their views made.
+    Textures,
+    /// Their staging: making, reading, detiling, recording.
+    Upload,
+}
+
+/// Adds the time since `from` to `part`, and returns now.
+fn heap_part(part: HeapPart, from: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    HEAP_PARTS[part as usize].fetch_add((now - from).as_nanos() as u64, Ordering::Relaxed);
+    now
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1313,10 +1349,13 @@ impl State {
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
+            HEAP_COUNTS[1].fetch_add(1, Ordering::Relaxed);
             host.buffer_slots()
         } else {
             changed
         };
+        HEAP_COUNTS[0].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        let mut at = heap_part(HeapPart::Slots, started);
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1327,7 +1366,9 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let view = host.mirror(index, handle, true);
+            at = heap_part(HeapPart::Views, at);
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1347,7 +1388,9 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let copy = crate::descriptor::host::buffer_copy(&view);
+            at = heap_part(HeapPart::Copies, at);
+            let Some((shadow, address, len)) = copy else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1367,6 +1410,9 @@ impl State {
             span.2 = span.2.max(*to);
         }
         drop(kept);
+        HEAP_COUNTS[2].fetch_add(u64::from(views), Ordering::Relaxed);
+        HEAP_COUNTS[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        at = heap_part(HeapPart::Spans, at);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1400,6 +1446,7 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        heap_part(HeapPart::Refresh, at);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1466,6 +1513,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let at = std::time::Instant::now();
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1499,12 +1547,23 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        // `VICTORY_HEAP_TEXTURES_MS` sets that time (250).
+        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| {
+            let ms = std::env::var("VICTORY_HEAP_TEXTURES_MS").ok().and_then(|v| v.parse().ok());
+            std::time::Duration::from_millis(ms.unwrap_or(250))
+        });
         let began = std::time::Instant::now();
+        let mut at = heap_part(HeapPart::Due, at);
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if began.elapsed() > span {
+                HEAP_COUNTS[6].fetch_add(1, Ordering::Relaxed);
                 break;
             }
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
+                break;
+            }
+            HEAP_COUNTS[4].fetch_add(1, Ordering::Relaxed);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -1521,6 +1580,7 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                at = heap_part(HeapPart::Mapped, at);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1560,7 +1620,9 @@ impl State {
                 }
                 continue;
             }
+            at = heap_part(HeapPart::Due, at);
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            at = heap_part(HeapPart::Textures, at);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1582,6 +1644,8 @@ impl State {
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
+            at = heap_part(HeapPart::Upload, at);
+            HEAP_COUNTS[5].fetch_add(1, Ordering::Relaxed);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)

@@ -5725,6 +5725,20 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        if picked > 0.0 {
+            let parts = std::array::from_fn::<f64, 9, _>(|i| {
+                crate::draw::HEAP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames
+            });
+            let [slots, full, views, spans, looked, textures, cut] =
+                std::array::from_fn(|i| crate::draw::HEAP_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "pass over the heap, ms per frame: buffers: which slots {:.1}, views {:.1}, their copies {:.1}, spans {:.1}, \
+                 refresh {:.1}; textures: which slots {:.1}, what is mapped {:.1}, made {:.1}, uploaded {:.1}; per frame: {slots:.0} \
+                 buffer slots looked at, {full:.2} passes over all, {views:.0} views, {spans:.0} spans, {looked:.0} texture slots \
+                 looked at, {textures:.0} textures, {cut:.2} passes out of time",
+                parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]
+            );
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
