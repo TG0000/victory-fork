@@ -1335,18 +1335,18 @@ fn scratch_pool() -> bool {
 
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
-struct Spare<T> {
+pub(crate) struct Spare<T> {
     kept: Vec<(T, u64)>,
     bytes: u64,
 }
 
 impl<T> Spare<T> {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Spare { kept: Vec::new(), bytes: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
-    fn take(&mut self, size: u64) -> Option<T> {
+    pub(crate) fn take(&mut self, size: u64) -> Option<T> {
         let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
@@ -1361,6 +1361,24 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+
+    /// Keeps `thing` (`size` bytes) and returns what that takes the kept
+    /// bytes past `most` for, the oldest first (`thing` itself if it alone
+    /// is larger): sizes nobody asks for again do not stay.
+    pub(crate) fn give_for(&mut self, thing: T, size: u64, most: u64) -> Vec<T> {
+        if size > most {
+            return vec![thing];
+        }
+        let (mut went, mut bytes) = (0, self.bytes + size);
+        while bytes > most {
+            bytes -= self.kept[went].1;
+            went += 1;
+        }
+        self.bytes = bytes;
+        let old = self.kept.drain(..went).map(|(thing, _)| thing).collect();
+        self.kept.push((thing, size));
+        old
     }
 }
 
@@ -5956,6 +5974,20 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        if picked > 0.0 {
+            let parts = std::array::from_fn::<f64, 9, _>(|i| {
+                crate::draw::HEAP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames
+            });
+            let [slots, full, views, spans, looked, textures, cut] =
+                std::array::from_fn(|i| crate::draw::HEAP_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "pass over the heap, ms per frame: buffers: which slots {:.1}, views {:.1}, their copies {:.1}, spans {:.1}, \
+                 refresh {:.1}; textures: which slots {:.1}, what is mapped {:.1}, made {:.1}, uploaded {:.1}; per frame: {slots:.0} \
+                 buffer slots looked at, {full:.2} passes over all, {views:.0} views, {spans:.0} spans, {looked:.0} texture slots \
+                 looked at, {textures:.0} textures, {cut:.2} passes out of time",
+                parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]
+            );
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -6650,6 +6682,21 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// The oldest things go for a new one, and one over the limit is not
+    /// kept at all.
+    #[test]
+    fn the_oldest_go_for_a_new_one() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert!(spare.give_for(1, 4, 10).is_empty());
+        assert!(spare.give_for(2, 4, 10).is_empty());
+        assert_eq!(spare.give_for(3, 11, 10), [3]);
+        assert_eq!(spare.give_for(4, 4, 10), [1]);
+        assert_eq!(spare.bytes, 8);
+        assert_eq!(spare.give_for(5, 10, 10), [2, 4]);
+        assert_eq!(spare.take(10), Some(5));
+        assert_eq!(spare.bytes, 0);
     }
 }
 
