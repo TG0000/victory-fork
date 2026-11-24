@@ -9481,7 +9481,11 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
-                // The clamped then the unclamped level of detail.
+                // The clamped then the unclamped level of detail; an array's
+                // slice has no part in it, and DXIL takes none.
+                for slice in &mut cs[spatial..] {
+                    *slice = fu;
+                }
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
                 };

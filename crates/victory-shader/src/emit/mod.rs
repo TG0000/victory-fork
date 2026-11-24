@@ -491,6 +491,25 @@ pub fn emit(
             }
         }
     }
+    // A host wave that is the console wave (64 lanes) and an operation that asks the lanes
+    // one by one where an early-out left some behind (the wave sum of 16-bit floats): the
+    // same exact forms, with no barrier to add.
+    if native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() != 32
+        && matches!(&original, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what))
+    {
+        for p in [ir::without_early_outs(p), ir::without_skips(p, false)].into_iter().flatten() {
+            let again = structure::structure(&p).and_then(|st| {
+                let io = io::raise(&p, native)?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+                emit_program(c, native, &p, &st, &io, &res)
+            });
+            if let Ok((shader, _)) = again {
+                return Ok(shader);
+            }
+        }
+    }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
