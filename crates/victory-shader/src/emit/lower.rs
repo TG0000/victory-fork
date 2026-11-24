@@ -308,6 +308,8 @@ struct Lower<'a> {
     half_waves: bool,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
+    /// See [`collision_sgpr`].
+    collision: Option<u8>,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
@@ -360,6 +362,28 @@ enum MaskData {
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
     /// console's but no host wave size can be declared.
     None,
+}
+
+/// The `src_pops_exiting_wave_id` operand.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+
+/// The SGPR holding the collision wave id of a pixel program with
+/// primitive-ordered sections (rasterizer ordered views), and what makes it
+/// one: it sets the POPS_PACKER register. The hardware puts the primitive
+/// mask after the user SGPRs, then this one: bit 31 is set when the wave
+/// overlaps an earlier one, whose ids (in the other bits) it waits for.
+fn collision_sgpr(x: &Parts) -> Option<u8> {
+    let packer = |i: &Inst| {
+        matches!(&i.fields, Fields::Sop { imm: Some(imm), .. }
+            if i.name().starts_with("s_setreg") && imm & 0x3F == 25)
+    };
+    let mut insts = x.p.blocks.iter().flat_map(|b| &b.insts);
+    if x.native.stage != HwStage::Ps || !insts.any(packer) {
+        return None;
+    }
+    let user = x.native.layout.iter().filter(|r| r.sgprs > 0);
+    let user = user.map(|r| u32::from(r.user_data) + r.sgprs).max()?;
+    u8::try_from(user + 1).ok()
 }
 
 /// What a value holding a lane mask read as a number stops with.
@@ -1585,6 +1609,7 @@ impl<'a> Lower<'a> {
                 && host_pixel_wave() > 32
                 && std::env::var_os("VICTORY_PS_HALVES").is_none_or(|v| v != "0"),
             mask_ok: false,
+            collision: collision_sgpr(x),
             ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
@@ -2250,6 +2275,9 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // No wave overlaps an earlier one: the host orders the
+                    // accesses (`image`), not the program's wait.
+                    None if self.collision == Some(n) => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3105,6 +3133,10 @@ impl<'a> Lower<'a> {
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
+            }
+            // Read where the program waits for the waves it overlaps: none.
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.collision.is_some() => {
+                Ok(self.s.m.i32(0))
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -9282,7 +9314,18 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let mut props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        // Coherent accesses of a program with primitive-ordered sections are
+        // its rasterizer ordered views': the host orders them.
+        if let Fields::Image { cache, .. } = &inst.fields
+            && uav
+            && cache.glc
+            && self.collision.is_some()
+            && !name.starts_with("image_atomic_")
+        {
+            self.s.flags |= flags::ROVS;
+            props.0 |= 0x2000;
+        }
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
