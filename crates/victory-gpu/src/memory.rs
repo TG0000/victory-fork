@@ -28,8 +28,7 @@
 //! the dispatch name: the whole copy around each root view, around each
 //! pair of root constants that is a title address and around each root
 //! constant that is one in 256-byte units (the builder passes structures
-//! all three ways), and the 4 MiB after each (a structure may cross a
-//! window's end).
+//! all three ways), and the [`AHEAD`] bytes after each.
 //! shortcut: what a stage reaches only through pointers it reads out of
 //! memory (InitHeaders' table of structure addresses, LoadInstances'
 //! instance records) is not made ready unless something else named it;
@@ -57,8 +56,8 @@ use crate::shadow::Shadow;
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 4095;
-/// A window of memory outside buffers (`shadow.rs`).
-const CELL: u64 = 4 << 20;
+/// What is made ready from an address a dispatch names on.
+const AHEAD: u64 = 512 << 10;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 /// Title addresses shaders reach begin here: what the process has below is
@@ -86,6 +85,12 @@ struct Memory {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
+/// The pages of the [`AHEAD`] bytes from `address` on.
+fn ahead(address: u64) -> impl Iterator<Item = u64> {
+    let first = address & !(PAGE - 1);
+    (first..address.saturating_add(AHEAD)).step_by(PAGE as usize)
+}
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -120,28 +125,28 @@ impl Memory {
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's: the copy a root view there gets (`named`), or one no
-    /// bigger than a page needs.
-    fn map(&mut self, address: u64, named: bool) {
+    /// bigger than a page needs. Whether the page has a copy now.
+    fn map(&mut self, address: u64, named: bool) -> bool {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 || address < LOWEST {
-            return;
+            return false;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
         if unsafe { entry.read() } != 0 {
-            return;
+            return true;
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return false;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return false;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
@@ -153,12 +158,12 @@ impl Memory {
             false => crate::shadow::find_page(start, PAGE).filter(whole),
         };
         let Some(shadow) = found else {
-            return;
+            return false;
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return false;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
@@ -190,7 +195,7 @@ impl Memory {
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
                 });
-                return;
+                return false;
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -200,6 +205,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        true
     }
 
     /// The pages shaders found empty since the last frame.
@@ -245,11 +251,24 @@ impl Memory {
         }
     }
 
-    /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address, true);
-        self.map((address & !(CELL - 1)) + CELL, true);
+    /// What a dispatch names: a root view's copy (`view`: it is bound
+    /// anyway, the whole 4 MiB cell), and the [`AHEAD`] bytes from the
+    /// address on, in copies no bigger than pages need, up to the first
+    /// page that is not the title's. The cell of every named address and
+    /// the 4 MiB after it were copied whole until now: 2,276 copies of
+    /// 7.2 GB after a minute, most of them by root constants that only look
+    /// like addresses, and the PC's memory ran out.
+    /// shortcut: what lies further on is found empty by the shader once
+    /// (that access is lost) and is there from the next frame on.
+    fn name(&mut self, address: u64, view: bool) {
+        if view {
+            self.map(address, true);
+        }
+        for page in ahead(address) {
+            if !self.map(page, false) {
+                break;
+            }
+        }
     }
 }
 
@@ -279,7 +298,7 @@ pub(crate) fn ready(
     }
     let numbered = m.copies.len();
     for &address in addresses {
-        m.name(address);
+        m.name(address, true);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -289,10 +308,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, false);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, false);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -336,4 +355,23 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AHEAD, PAGE, ahead};
+
+    /// The pages made ready hold every byte of the span, none after it,
+    /// and an address at the end of the space wraps nowhere.
+    #[test]
+    fn the_pages_ahead_hold_the_span() {
+        let on_a_page: Vec<u64> = ahead(0xd_1234_0000).collect();
+        assert_eq!(on_a_page.len() as u64, AHEAD / PAGE);
+        assert_eq!(on_a_page[0], 0xd_1234_0000);
+        let inside: Vec<u64> = ahead(0xd_1234_8000).collect();
+        assert_eq!(inside.len() as u64, AHEAD / PAGE + 1);
+        assert_eq!(inside[0], 0xd_1234_0000);
+        assert!(inside.last().unwrap() + PAGE >= 0xd_1234_8000 + AHEAD);
+        assert!(ahead(u64::MAX - 10).count() <= 1);
+    }
 }
