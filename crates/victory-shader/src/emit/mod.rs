@@ -1744,6 +1744,25 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// A first half read as a value of its own (here added to the whole
+    /// interpolation) is P0 + i (P1 - P0): the attribute is read per vertex.
+    #[test]
+    fn a_first_half_read_on_its_own_is_evaluated() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC808_0000,        // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E08_0302,        // v_mov_b32 v4, v2
+            0xC809_0001,        // v_interp_p2_f32 v2, v1, attr0.x
+            v_add_f32(3, 2, 4), // v3 = attribute + first half
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
     /// P10 of an attribute the program interpolates is P1 - P0.
     #[test]
     fn p10_of_an_interpolated_attribute() {

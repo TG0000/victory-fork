@@ -87,6 +87,30 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    let r = lower_io(parts);
+    // A first half of an interpolation read as a value of its own: it is
+    // evaluated from its vertices (the weights of its attribute's other
+    // reads too), which costs the programs that do not need it.
+    if !matches!(r, Err(ShaderError::Unsupported { what, .. }) if what == FIRST_HALF) {
+        return r;
+    }
+    let io = parts.io.with_first_halves(parts.p);
+    lower_io(&Parts {
+        native: parts.native,
+        p: parts.p,
+        st: parts.st,
+        io: &io,
+        res: parts.res,
+        inputs: parts.inputs.clone(),
+        outputs: parts.outputs.clone(),
+        prims: parts.prims.clone(),
+        mesh_stride: parts.mesh_stride,
+    })
+}
+
+const FIRST_HALF: Why = "the first half of an interpolation";
+
+fn lower_io(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -8732,7 +8756,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
