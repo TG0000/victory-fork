@@ -108,6 +108,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{set_host_max_wave, set_host_pixel_wave};
 pub use rect::rect_list_gs;
@@ -165,6 +166,38 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// The clean-up passes that run over a translated program before it is
+/// written (`bitcode::opt`): a set of that module's pass bits. Every pass
+/// is exact, so the switch is for telling a translator fault from a
+/// clean-up fault, and for measuring what the clean-up is worth.
+/// `VICTORY_SHADER_OPT`:
+/// - unset: every pass.
+/// - `0`: none (the module as the lowering made it).
+/// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
+///   and identities, 4 one instruction for one value, 8 what a branch taken
+///   says about its condition, 16 one read for one place within a block,
+///   32 a first-lane read of two host waves without the round that asks
+///   which half has a lane (where every lane has one).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
+/// unreadable. Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -262,6 +295,35 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// DXIL wants one interpolation mode for all the elements of a signature
+/// row. Integer attributes and `SV_IsFrontFace` can only be constant, so the
+/// elements of their row nothing reads are too; a pixel input nothing reads
+/// otherwise takes the mode of the one of its row that is read (after the
+/// lowering has found it). `outputs`: a vertex or mesh stage's, where the mode
+/// means nothing (the pixel stage's inputs say how an attribute is
+/// interpolated), so the whole row takes it.
+/// (Pixel inputs: VIctory #306, wrothgaril.)
+pub(super) fn harmonize_row_interp(elements: &mut [container::SigElement], outputs: bool) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let here = |e: &container::SigElement| e.row == Some(row) && e.interp != 0;
+        let constant = elements.iter().any(|e| here(e) && (e.kind == 13 || (e.kind == 0 && e.comp != 9)));
+        let mode = if constant {
+            Some(1)
+        } else {
+            elements.iter().find(|e| here(e) && e.usage != 0).map(|e| e.interp)
+        };
+        let Some(m) = mode else { continue };
+        for e in elements.iter_mut() {
+            if here(e) && (outputs || e.usage == 0) {
+                e.interp = m;
+            }
+        }
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -429,6 +491,25 @@ pub fn emit(
             }
         }
     }
+    // A host wave that is the console wave (64 lanes) and an operation that asks the lanes
+    // one by one where an early-out left some behind (the wave sum of 16-bit floats): the
+    // same exact forms, with no barrier to add.
+    if native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() != 32
+        && matches!(&original, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what))
+    {
+        for p in [ir::without_early_outs(p), ir::without_skips(p, false)].into_iter().flatten() {
+            let again = structure::structure(&p).and_then(|st| {
+                let io = io::raise(&p, native)?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+                emit_program(c, native, &p, &st, &io, &res)
+            });
+            if let Ok((shader, _)) = again {
+                return Ok(shader);
+            }
+        }
+    }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
@@ -547,7 +628,7 @@ fn emit_program(
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -560,6 +641,7 @@ fn emit_program(
             _ => 0,
         };
     }
+    harmonize_row_interp(interpolated, !pixel);
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -726,6 +808,46 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn a_signature_row_has_one_interpolation_mode() {
+        let e = |kind, comp, interp, usage| super::container::SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(1),
+            col: 0,
+            cols: 1,
+            usage,
+            half: false,
+        };
+        let modes = |els: &[super::container::SigElement]| els.iter().map(|e| e.interp).collect::<Vec<_>>();
+        // A pixel input nothing reads beside an integer; one that is read keeps its mode.
+        let mut els = [e(0, 5, 1, 1), e(0, 9, 2, 0), e(0, 9, 2, 1)];
+        super::harmonize_row_interp(&mut els, false);
+        assert_eq!(modes(&els), [1, 1, 2]);
+        // ... beside one read flat.
+        let mut els = [e(0, 9, 2, 0), e(0, 9, 1, 1)];
+        super::harmonize_row_interp(&mut els, false);
+        assert_eq!(modes(&els), [1, 1]);
+        // An output row, whole.
+        let mut els = [e(0, 5, 1, 1), e(0, 9, 2, 1)];
+        super::harmonize_row_interp(&mut els, true);
+        assert_eq!(modes(&els), [1, 1]);
+    }
+
+    #[test]
+    fn the_clean_up_switch_parses_or_runs_every_pass() {
+        let all = super::bitcode::opt::ALL;
+        assert_eq!(parse_shader_opt(None), all);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
+        assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), all);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
@@ -1696,6 +1818,25 @@ mod barycentric_tests {
         let shader = pixel(&words, PERSP_CENTER).unwrap();
         let (_, inputs) = parts(&shader);
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    /// A first half read as a value of its own (here added to the whole
+    /// interpolation) is P0 + i (P1 - P0): the attribute is read per vertex.
+    #[test]
+    fn a_first_half_read_on_its_own_is_evaluated() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC808_0000,        // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E08_0302,        // v_mov_b32 v4, v2
+            0xC809_0001,        // v_interp_p2_f32 v2, v1, attr0.x
+            v_add_f32(3, 2, 4), // v3 = attribute + first half
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
     }

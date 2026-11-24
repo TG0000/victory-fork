@@ -186,10 +186,48 @@ pub struct Io {
     /// read before written hold undefined values.
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
+    /// First halves of interpolations, paired or not
+    /// (see [`Io::with_first_halves`]).
+    pub first_halves: Vec<(Site, Attribute)>,
     pub exports: Vec<Export>,
     /// Compute: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
+}
+
+impl Io {
+    /// The same I/O with the first halves something other than a second half
+    /// reads (directly or through joins) evaluated on their own, P0 + i P10.
+    pub fn with_first_halves(&self, p: &Program) -> Io {
+        let mut read = std::collections::HashSet::new();
+        for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+            if !inst.name().starts_with("v_interp_p2") {
+                read.extend(inst.reads.iter().map(|r| r.1));
+            }
+        }
+        let phis = || p.blocks.iter().flat_map(|b| &b.phis);
+        loop {
+            let before = read.len();
+            for phi in phis() {
+                if read.contains(&phi.value) {
+                    read.extend(&phi.args);
+                }
+            }
+            if read.len() == before {
+                break;
+            }
+        }
+        let mut io = self.clone();
+        for &(site, attribute) in &self.first_halves {
+            let inst = &p.blocks[site.0].insts[site.1];
+            if inst.writes.iter().any(|w| read.contains(&w.1))
+                && !io.interps.iter().any(|(s, _)| *s == site)
+            {
+                io.interps.push((site, Interp::Weighted { attribute }));
+            }
+        }
+        io
+    }
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -382,7 +420,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => io.first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +440,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        io.first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
