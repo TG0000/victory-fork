@@ -201,6 +201,11 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// The four words of an immediate sampler.
+fn sampler_words(words: &[u32]) -> Result<[u32; 4], Why> {
+    words.get(..4).and_then(|w| w.try_into().ok()).ok_or("a sampler constant")
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -6208,23 +6213,8 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                let words = sampler_words(words)?;
+                self.immediate_sampler(words, props)
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -6292,6 +6282,69 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The handle of the immediate sampler `words` (a static sampler).
+    fn immediate_sampler(&mut self, words: [u32; 4], props: (u32, u32)) -> Result<V, Why> {
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        if props.0 & 0x8000 != 0 {
+            // shortcut: one sampler used with and without comparison
+            // would need two static samplers; it becomes a comparison one.
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(self.s.sampler_handle(self.cur, n as u32))
+    }
+
+    /// The handles of the sampler `src` read at `site`, and which one the lanes
+    /// use: one handle, or, for immediate samplers a uniform branch chose among
+    /// (each edge of the join names a constant one), one per choice and the
+    /// choice's position, picked at the join. Static samplers are one register
+    /// each, so no shader array can index them: the sampling instruction runs
+    /// once per choice and the position picks the result.
+    /// (VIctory #1008, Thiago.)
+    fn sampler_choice(&mut self, site: Site, src: &Source, props: (u32, u32)) -> Result<(Vec<V>, Option<V>), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let Source::Phi { block, args } = src else {
+            return Ok((vec![self.handle(site, src, true, props)?], None));
+        };
+        if !args.iter().all(|a| matches!(a, Source::Constant(_))) {
+            return Ok((vec![self.handle(site, src, true, props)?], None));
+        }
+        let mut edges = Vec::new();
+        let mut choices: Vec<[u32; 4]> = Vec::new();
+        for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let Source::Constant(words) = arg else {
+                unreachable!("checked above");
+            };
+            let words = sampler_words(words)?;
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            let k = choices.iter().position(|c| *c == words).unwrap_or_else(|| {
+                choices.push(words);
+                choices.len() - 1
+            });
+            edges.push((self.s.m.i32(k as u32), at));
+        }
+        let mut handles = Vec::new();
+        for words in &choices {
+            handles.push(self.immediate_sampler(*words, props)?);
+        }
+        if handles.len() < 2 {
+            return Ok((handles, None));
+        }
+        let join = self.block[*block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, edges);
+        Ok((handles, Some(phi)))
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -9445,6 +9498,8 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        // The samplers control flow chose among, and the position of the choice.
+        let mut choice: Option<(Vec<V>, V)> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -9457,7 +9512,9 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let (shs, pick) = self.sampler_choice(site, ss, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sh = shs[0];
+            choice = pick.map(|p| (shs, p));
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -9515,6 +9572,9 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
+                if choice.is_some() {
+                    return Err("a level query with a sampler chosen by control flow");
+                }
                 // The clamped then the unclamped level of detail; an array's
                 // slice has no part in it, and DXIL takes none.
                 for slice in &mut cs[spatial..] {
@@ -9873,12 +9933,26 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
+        // One sample per sampler the choice is among, and the one it picks.
+        let mut others = Vec::new();
+        if let (Some((shs, pick)), None) = (&choice, gathered) {
+            for (k, &sh) in shs.iter().enumerate().skip(1) {
+                let again = self.s.m.call_again(c, r, shs[0], sh);
+                let k = self.s.m.i32(k as u32);
+                let here = self.s.m.cmp(c, pred::EQ, *pick, k);
+                others.push((again.ok_or("a sample with a sampler chosen by control flow")?, here));
+            }
+        }
         let mut xs = Vec::new();
         for ch in channels {
-            let x = match gathered {
+            let mut x = match gathered {
                 Some(g) => g[ch as usize],
                 None => self.s.m.extract(c, r, ch),
             };
+            for &(again, here) in &others {
+                let y = self.s.m.extract(c, again, ch);
+                x = self.s.m.select(c, here, y, x);
+            }
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.

@@ -449,6 +449,20 @@ impl Module {
         };
         self.push(block, ret, Op::Call(i, args))
     }
+    /// The call `v` once more in `block`, with `new` for its argument `old`.
+    pub fn call_again(&mut self, block: usize, v: V, old: V, new: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        let inst = &self.insts[i as usize];
+        let ty = inst.ty;
+        let Op::Call(f, args) = &inst.op else { return None };
+        let (f, mut args) = (*f, args.clone());
+        let mut found = args.iter_mut().filter(|a| **a == old);
+        *found.next()? = new;
+        if found.next().is_some() {
+            return None;
+        }
+        Some(self.push(block, ty, Op::Call(f, args)))
+    }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
         let i = self.insts.len() as u32;
