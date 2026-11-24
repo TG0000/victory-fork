@@ -1437,7 +1437,8 @@ struct CardWork {
     /// After it ran: the pieces that differ come down.
     fetch: Prelude,
     root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+    /// By [`hash_wide`].
+    psos: [ID3D12PipelineState; 2],
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1573,13 +1574,13 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// come after all its copies, behind one barrier (`VICTORY_CARD_HASH_WIDE=0`:
 /// a thread per piece, copies and passes in turn, as before).
 fn hash_wide() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
+    static WIDE: crate::flip::Pair = crate::flip::Pair::new("VICTORY_CARD_HASH_WIDE");
+    WIDE.get() != Some("0")
 }
 
 /// The groups that hash `pieces` pieces.
-fn hash_groups(pieces: u32) -> u32 {
-    if hash_wide() { pieces } else { pieces.div_ceil(64) }
+fn hash_groups(wide: bool, pieces: u32) -> u32 {
+    if wide { pieces } else { pieces.div_ceil(64) }
 }
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
@@ -3000,8 +3001,8 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let compiled = |source: &str| -> windows::core::Result<ID3DBlob> {
         let mut code: Option<ID3DBlob> = None;
-        let source = if hash_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE };
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
@@ -3019,7 +3020,10 @@ impl Host {
                 None,
             )?;
         }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        code.ok_or_else(windows::core::Error::empty)
+        };
+        let code = compiled(CARD_COMPARE)?;
+        let wide = compiled(CARD_COMPARE_WIDE)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3031,20 +3035,23 @@ impl Host {
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
+            let pso = |code: &ID3DBlob| -> windows::core::Result<ID3D12PipelineState> {
+                self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+            };
+            let psos = [pso(&code)?, pso(&wide)?];
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
-                pso,
+                psos,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -3103,9 +3110,25 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        let wide = hash_wide();
+        let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+        // Hashes of the other hash (an arm changed, `crate::flip`) are made
+        // again, all of them.
+        for (shadow, _) in &dirty {
+            if shadow.card_hashed_otherwise(wide) {
+                whole.push(shadow.clone());
+            }
+        }
+        for (shadow, _) in &declared {
+            if shadow.card_hashed_otherwise(wide) {
+                whole.push(shadow.clone());
+                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                    dirty.push((shadow.clone(), Vec::new()));
+                }
+            }
+        }
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
-        let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
@@ -3142,7 +3165,6 @@ impl Host {
                     };
                     // All copies first, then one barrier, then all passes
                     // ([`hash_wide`]).
-                    let wide = hash_wide();
                     if wide {
                         let mut barriers = Vec::new();
                         for (shadow, ranges) in &dirty {
@@ -3186,7 +3208,7 @@ impl Host {
                             )]);
                         }
                         list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
+                        list.SetPipelineState(&work.psos[usize::from(wide)]);
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -3202,7 +3224,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(hash_groups(run.pieces), 1, 1);
+                            list.Dispatch(hash_groups(wide, run.pieces), 1, 1);
                         }
                     }
                     #[cfg(feature = "diagnostics")]
@@ -3281,7 +3303,7 @@ impl Host {
                         },
                     }]);
                     list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    list.SetPipelineState(&work.psos[usize::from(wide)]);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
@@ -3291,7 +3313,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(hash_groups(r.span.pieces), 1, 1);
+                        list.Dispatch(hash_groups(wide, r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     #[cfg(feature = "diagnostics")]

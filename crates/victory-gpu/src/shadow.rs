@@ -91,6 +91,8 @@ struct Card {
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
     before: Mutex<Option<ID3D12Resource>>,
+    /// Which hash the bytes in `before` are ([`Shadow::card_hashed_otherwise`]).
+    hash: std::sync::atomic::AtomicU8,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
@@ -2510,6 +2512,16 @@ impl Shadow {
         before.is_some()
     }
 
+    /// Whether the copy's hashes are of another kind than `wide` says and
+    /// have to be made again, whole; from now on they count as of that kind.
+    pub(crate) fn card_hashed_otherwise(&self, wide: bool) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        let was = card.hash.swap(u8::from(wide), Ordering::Relaxed);
+        was != u8::from(wide) && was != 2 && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     /// The declared range `[address, end)` as the compare on the card
     /// takes it; `None` if none of it lies in the copy.
     pub(crate) fn card_span(&self, address: usize, end: usize) -> Option<CardSpan> {
@@ -2804,6 +2816,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
+                    hash: std::sync::atomic::AtomicU8::new(2),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
@@ -3020,6 +3033,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             let card = Card {
                 staging: buffer,
                 before: Mutex::default(),
+                hash: std::sync::atomic::AtomicU8::new(2),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
