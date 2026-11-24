@@ -760,6 +760,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+            #[cfg(feature = "diagnostics")]
+            list.cost_mark("barrier states");
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host = unsafe {
@@ -1950,6 +1952,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        #[cfg(feature = "diagnostics")]
+        list.cost_mark("barrier groups");
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.

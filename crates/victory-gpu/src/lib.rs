@@ -29,6 +29,8 @@ pub mod fence;
 #[cfg(windows)]
 mod fps;
 pub mod frame;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gpucost;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

@@ -1728,6 +1728,19 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
+        if crate::gpucost::on() && !crate::host::dred_on() {
+            // Only what the sums are by: the rest costs the recording.
+            if !compute {
+                let size = |t: usize| {
+                    // SAFETY: a live resource.
+                    let d = crate::resource::host_made(t as This).map(|r| unsafe { r.GetDesc() });
+                    d.map(|d| format!(" {}x{} f{}", d.Width, d.Height, d.Format.0))
+                };
+                self.targets.iter().filter_map(|&t| size(t)).for_each(|t| text.push_str(&t));
+                text.push_str(&size(self.depth).map_or(String::new(), |d| format!(" depth{d}")));
+            }
+            return text;
+        }
         // What it draws into (a dispatch writes through its views below).
         if !compute {
             let described = |t: usize| {
@@ -2404,6 +2417,8 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                #[cfg(feature = "diagnostics")]
+                list.cost_mark("our indirect-clamp");
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {

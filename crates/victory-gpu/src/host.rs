@@ -382,6 +382,11 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
+    #[cfg(feature = "diagnostics")]
+    if let Some(host) = host() {
+        // SAFETY: a plain query.
+        crate::gpucost::report(frames, unsafe { host.queue.GetTimestampFrequency() }.unwrap_or(1));
+    }
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
@@ -757,6 +762,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Submitted since its timestamps were last read (`VICTORY_GPU_COST`).
+    #[cfg(feature = "diagnostics")]
+    cost: std::sync::atomic::AtomicBool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2846,6 +2854,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                cost: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -3042,6 +3052,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let cost = crate::gpucost::begin(list, "our card-sync");
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3087,6 +3099,8 @@ impl Host {
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpucost::end(list, cost);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3148,6 +3162,8 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let cost = crate::gpucost::begin(list, "our card-compare");
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3172,6 +3188,8 @@ impl Host {
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpucost::end(list, cost);
                     list.Close()?;
                     list.cast()
                 })()
@@ -3533,9 +3551,13 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let cost = crate::gpucost::begin(list, "our fetch");
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpucost::end(list, cost);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -3954,6 +3976,10 @@ impl Host {
         }
         for list in runs {
             list.run_deferred(&mut batch);
+            #[cfg(feature = "diagnostics")]
+            if crate::gpucost::on() {
+                list.cost.store(true, Ordering::Relaxed);
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4334,51 +4360,74 @@ impl Host {
     }
 }
 
+/// A heap of `count` GPU timestamps and a read-back buffer for them
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timestamps(count: u32) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let device = &host()?.device;
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: count, NodeMask: 0 },
+                &mut heap,
+            )
+            .ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !timing() && !crate::gpucost::on() {
             return None;
         }
-        self.stamps
-            .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
-            })
-            .as_ref()
+        self.stamps.get_or_init(|| timestamps(STAMPS)).as_ref()
+    }
+
+    /// The timestamps of the first `count` noted commands and the one after
+    /// them (diagnostics, after the list ran); empty without any.
+    #[cfg(feature = "diagnostics")]
+    fn stamp_values(&self, count: usize) -> Vec<u64> {
+        let Some((_, back)) = self.stamps() else {
+            return Vec::new();
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return Vec::new();
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        }
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
@@ -4386,20 +4435,13 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let (Some(_), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
-        let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
-        // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
-            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
-            }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
-            back.Unmap(0, None);
-            s
-        };
+        let stamps = self.stamp_values(count);
+        if stamps.is_empty() {
+            return Vec::new();
+        }
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
@@ -4436,6 +4478,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        #[cfg(feature = "diagnostics")]
+        self.cost_ran();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4763,6 +4807,8 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                let cost = crate::gpucost::begin(list, "our state prelude");
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -4772,6 +4818,8 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::gpucost::end(list, cost);
                 list.Close()
             })
         };
@@ -4797,10 +4845,58 @@ impl HostList {
         self.note(what, Some(range));
     }
 
+    /// With `VICTORY_GPU_COST`: what comes next is `what`, a step of ours
+    /// or a wait that is no command of its own.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn cost_mark(&self, what: &str) {
+        if crate::gpucost::on() && !dred_on() {
+            self.cost_note(|| what.to_owned());
+        }
+    }
+
+    /// A timestamp before the command about to be recorded
+    /// (`VICTORY_GPU_COST`).
+    #[cfg(feature = "diagnostics")]
+    fn cost_note(&self, what: impl FnOnce() -> String) {
+        let what = what();
+        crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let at = notes.len() as u32;
+        if let Some((heap, _)) = self.stamps()
+            && at < STAMPS - 1
+        {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            notes.push((what, None));
+        } else {
+            crate::gpucost::UNTIMED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Gives the list's timestamps to the report, if the card ran it since
+    /// they were last given.
+    #[cfg(feature = "diagnostics")]
+    fn cost_ran(&self) {
+        if !crate::gpucost::on() || !self.cost.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        if notes.is_empty() {
+            return;
+        }
+        let stamps = self.stamp_values(notes.len());
+        let texts: Vec<&str> = notes.iter().map(|n| n.0.as_str()).collect();
+        crate::gpucost::ran(&texts, &stamps);
+    }
+
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !dred_on() {
-            crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            if crate::gpucost::on() {
+                self.cost_note(what);
+            } else {
+                crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            }
             return;
         }
         {
