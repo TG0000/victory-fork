@@ -5614,6 +5614,35 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether the image descriptor `inst` loads into eight SGPRs from `code` on is read for
+    /// its width, height and base level alone, with the scalar shifts and masks the console
+    /// compiler takes those fields apart with: dwords 1 to 3, the height's bits (dword 2
+    /// from 14 on) among them.
+    fn only_size_read(&self, inst: &Inst, code: u8) -> bool {
+        let dword = |v: Value| (0..8u8).find(|&k| inst.write(Reg::S(code + k)) == Some(v));
+        let mut height = false;
+        for blk in &self.x.p.blocks {
+            if blk.phis.iter().any(|phi| phi.args.iter().any(|&a| dword(a).is_some())) {
+                return false;
+            }
+            for i in &blk.insts {
+                for k in i.reads.iter().filter_map(|r| dword(r.1)) {
+                    if !(1..=3).contains(&k) || !matches!(i.name(), "s_lshr_b32" | "s_lshl_b32" | "s_bfe_u32" | "s_and_b32") {
+                        return false;
+                    }
+                    if k == 2
+                        && i.name() == "s_bfe_u32"
+                        && let Fields::Sop { src, .. } = &i.fields
+                        && matches!(src.get(1), Some(Operand::Literal(0x0010_000E | 0x000E_000E)))
+                    {
+                        height = true;
+                    }
+                }
+            }
+        }
+        height
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -5679,7 +5708,11 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
+        // An image the program asks only for its size: no instruction says its kind, the
+        // dwords read do. (Width and height; a cube's or an array's would be the same.)
+        let by_use = use_of(site).or_else(twin);
+        let size_only = by_use.is_none() && count == 8 && self.only_size_read(inst, code);
+        let use_at = by_use.or(size_only.then_some((site, 0)));
         let Some((at, first)) = use_at else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
@@ -5739,6 +5772,7 @@ impl<'a> Lower<'a> {
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
+            _ if size_only => ((2, 0x409), Some(2)),
             // A ray-tracing structure in a buffer of the host: read raw.
             Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
             Fields::Image { dim, .. } => {
