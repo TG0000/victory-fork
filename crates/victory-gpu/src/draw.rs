@@ -1499,10 +1499,11 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        static SPAN: crate::flip::Pair = crate::flip::Pair::new("VICTORY_HEAP_TEXTURES_MS");
+        let span = std::time::Duration::from_millis(SPAN.get().and_then(|v| v.parse().ok()).unwrap_or(250));
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -1728,6 +1729,19 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
+        if crate::gpucost::on() && !crate::host::dred_on() {
+            // Only what the sums are by: the rest costs the recording.
+            if !compute {
+                let size = |t: usize| {
+                    // SAFETY: a live resource.
+                    let d = crate::resource::host_made(t as This).map(|r| unsafe { r.GetDesc() });
+                    d.map(|d| format!(" {}x{} f{}", d.Width, d.Height, d.Format.0))
+                };
+                self.targets.iter().filter_map(|&t| size(t)).for_each(|t| text.push_str(&t));
+                text.push_str(&size(self.depth).map_or(String::new(), |d| format!(" depth{d}")));
+            }
+            return text;
+        }
         // What it draws into (a dispatch writes through its views below).
         if !compute {
             let described = |t: usize| {
@@ -2404,6 +2418,8 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                #[cfg(feature = "diagnostics")]
+                list.cost_mark("our indirect-clamp");
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {

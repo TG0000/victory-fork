@@ -382,6 +382,11 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
+    #[cfg(feature = "diagnostics")]
+    if let Some(host) = host() {
+        // SAFETY: a plain query.
+        crate::gpucost::report(frames, unsafe { host.queue.GetTimestampFrequency() }.unwrap_or(1));
+    }
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
@@ -757,6 +762,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Submitted since its timestamps were last read (`VICTORY_GPU_COST`).
+    #[cfg(feature = "diagnostics")]
+    cost: std::sync::atomic::AtomicBool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1429,7 +1437,8 @@ struct CardWork {
     /// After it ran: the pieces that differ come down.
     fetch: Prelude,
     root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+    /// By [`hash_wide`].
+    psos: [ID3D12PipelineState; 2],
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1495,6 +1504,84 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// As [`CARD_COMPARE`] (the same constants, cuts and results; another
+/// hash), with a group of 64 threads per piece: the threads take the
+/// piece's 16-byte steps in turn, 64 each, and their hashes are summed.
+/// One thread per piece made 4,096 loads one after the other, so a pass
+/// took milliseconds however few its pieces, and a wide one left the
+/// card's load units waiting. A change in the steps of one thread always
+/// changes that thread's hash, as before; the last mixing keeps changes in
+/// several threads from cancelling out in the sum.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint sum0;
+groupshared uint sum1;
+groupshared uint sum2;
+groupshared uint sum3;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    if (t == 0u) { sum0 = 0u; sum1 = 0u; sum2 = 0u; sum3 = 0u; }
+    GroupMemoryBarrierWithGroupSync();
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ ((t + 1u) * 0x9E3779B1u);
+    [loop]
+    for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    // Two rounds in which every word goes into every other.
+    h = (h ^ (h >> 16)) * 0x85EBCA6Bu;
+    h += h.yzwx;
+    h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+    h += h.zwxy;
+    h ^= h >> 16;
+    InterlockedAdd(sum0, h.x);
+    InterlockedAdd(sum1, h.y);
+    InterlockedAdd(sum2, h.z);
+    InterlockedAdd(sum3, h.w);
+    GroupMemoryBarrierWithGroupSync();
+    if (t != 0u || group.x >= pieces) return;
+    uint4 all = uint4(sum0, sum1, sum2, sum3);
+    if (compare != 0u) {
+        differs.Store(out_at + group.x * 4u, any(all != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, all);
+    } else {
+        hashes.Store4(piece * 16u, all);
+    }
+}
+"#;
+
+/// Whether the passes over copies in the card's memory hash with a group
+/// per piece ([`CARD_COMPARE_WIDE`]), and those before a submission's lists
+/// come after all its copies, behind one barrier (`VICTORY_CARD_HASH_WIDE=0`:
+/// a thread per piece, copies and passes in turn, as before).
+fn hash_wide() -> bool {
+    static WIDE: crate::flip::Pair = crate::flip::Pair::new("VICTORY_CARD_HASH_WIDE");
+    WIDE.get() != Some("0")
+}
+
+/// The groups that hash `pieces` pieces.
+fn hash_groups(wide: bool, pieces: u32) -> u32 {
+    if wide { pieces } else { pieces.div_ceil(64) }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -2846,6 +2933,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                cost: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -2912,13 +3001,14 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let compiled = |source: &str| -> windows::core::Result<ID3DBlob> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -2930,7 +3020,10 @@ impl Host {
                 None,
             )?;
         }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        code.ok_or_else(windows::core::Error::empty)
+        };
+        let code = compiled(CARD_COMPARE)?;
+        let wide = compiled(CARD_COMPARE_WIDE)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -2942,20 +3035,23 @@ impl Host {
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
+            let pso = |code: &ID3DBlob| -> windows::core::Result<ID3D12PipelineState> {
+                self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+            };
+            let psos = [pso(&code)?, pso(&wide)?];
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
-                pso,
+                psos,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -3014,9 +3110,25 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        let wide = hash_wide();
+        let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+        // Hashes of the other hash (an arm changed, `crate::flip`) are made
+        // again, all of them.
+        for (shadow, _) in &dirty {
+            if shadow.card_hashed_otherwise(wide) {
+                whole.push(shadow.clone());
+            }
+        }
+        for (shadow, _) in &declared {
+            if shadow.card_hashed_otherwise(wide) {
+                whole.push(shadow.clone());
+                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                    dirty.push((shadow.clone(), Vec::new()));
+                }
+            }
+        }
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
-        let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
@@ -3042,15 +3154,43 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
-                            continue;
-                        };
+                    #[cfg(feature = "diagnostics")]
+                    let cost = crate::gpucost::begin(list, "our card-sync");
+                    let copies = |shadow: &crate::shadow::Shadow, staging: &ID3D12Resource, ranges: &[(usize, usize)]| {
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                    };
+                    // All copies first, then one barrier, then all passes
+                    // ([`hash_wide`]).
+                    if wide {
+                        let mut barriers = Vec::new();
+                        for (shadow, ranges) in &dirty {
+                            let Some((staging, before, _)) = shadow.card_sides() else {
+                                continue;
+                            };
+                            copies(shadow, staging, ranges);
+                            if before.is_some() && !ranges.is_empty() {
+                                barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
+                        }
+                        if !barriers.is_empty() {
+                            list.ResourceBarrier(&barriers);
+                        }
+                    }
+                    for (shadow, ranges) in &dirty {
+                        let Some((staging, before, size)) = shadow.card_sides() else {
+                            continue;
+                        };
+                        if !wide {
+                            copies(shadow, staging, ranges);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -3060,7 +3200,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if !wide && !ranges.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3068,7 +3208,7 @@ impl Host {
                             )]);
                         }
                         list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
+                        list.SetPipelineState(&work.psos[usize::from(wide)]);
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -3084,9 +3224,11 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(hash_groups(wide, run.pieces), 1, 1);
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpucost::end(list, cost);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3148,6 +3290,8 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let cost = crate::gpucost::begin(list, "our card-compare");
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3159,7 +3303,7 @@ impl Host {
                         },
                     }]);
                     list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    list.SetPipelineState(&work.psos[usize::from(wide)]);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
@@ -3169,9 +3313,11 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(hash_groups(wide, r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpucost::end(list, cost);
                     list.Close()?;
                     list.cast()
                 })()
@@ -3533,9 +3679,13 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let cost = crate::gpucost::begin(list, "our fetch");
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::gpucost::end(list, cost);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -3954,6 +4104,10 @@ impl Host {
         }
         for list in runs {
             list.run_deferred(&mut batch);
+            #[cfg(feature = "diagnostics")]
+            if crate::gpucost::on() {
+                list.cost.store(true, Ordering::Relaxed);
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4334,51 +4488,74 @@ impl Host {
     }
 }
 
+/// A heap of `count` GPU timestamps and a read-back buffer for them
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timestamps(count: u32) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let device = &host()?.device;
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: count, NodeMask: 0 },
+                &mut heap,
+            )
+            .ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !timing() && !crate::gpucost::on() {
             return None;
         }
-        self.stamps
-            .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
-            })
-            .as_ref()
+        self.stamps.get_or_init(|| timestamps(STAMPS)).as_ref()
+    }
+
+    /// The timestamps of the first `count` noted commands and the one after
+    /// them (diagnostics, after the list ran); empty without any.
+    #[cfg(feature = "diagnostics")]
+    fn stamp_values(&self, count: usize) -> Vec<u64> {
+        let Some((_, back)) = self.stamps() else {
+            return Vec::new();
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return Vec::new();
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        }
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
@@ -4386,20 +4563,13 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let (Some(_), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
-        let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
-        // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
-            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
-            }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
-            back.Unmap(0, None);
-            s
-        };
+        let stamps = self.stamp_values(count);
+        if stamps.is_empty() {
+            return Vec::new();
+        }
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
@@ -4436,6 +4606,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        #[cfg(feature = "diagnostics")]
+        self.cost_ran();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4763,6 +4935,8 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                let cost = crate::gpucost::begin(list, "our state prelude");
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -4772,6 +4946,8 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::gpucost::end(list, cost);
                 list.Close()
             })
         };
@@ -4797,10 +4973,58 @@ impl HostList {
         self.note(what, Some(range));
     }
 
+    /// With `VICTORY_GPU_COST`: what comes next is `what`, a step of ours
+    /// or a wait that is no command of its own.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn cost_mark(&self, what: &str) {
+        if crate::gpucost::on() && !dred_on() {
+            self.cost_note(|| what.to_owned());
+        }
+    }
+
+    /// A timestamp before the command about to be recorded
+    /// (`VICTORY_GPU_COST`).
+    #[cfg(feature = "diagnostics")]
+    fn cost_note(&self, what: impl FnOnce() -> String) {
+        let what = what();
+        crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let at = notes.len() as u32;
+        if let Some((heap, _)) = self.stamps()
+            && at < STAMPS - 1
+        {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            notes.push((what, None));
+        } else {
+            crate::gpucost::UNTIMED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Gives the list's timestamps to the report, if the card ran it since
+    /// they were last given.
+    #[cfg(feature = "diagnostics")]
+    fn cost_ran(&self) {
+        if !crate::gpucost::on() || !self.cost.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        if notes.is_empty() {
+            return;
+        }
+        let stamps = self.stamp_values(notes.len());
+        let texts: Vec<&str> = notes.iter().map(|n| n.0.as_str()).collect();
+        crate::gpucost::ran(&texts, &stamps);
+    }
+
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !dred_on() {
-            crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            if crate::gpucost::on() {
+                self.cost_note(what);
+            } else {
+                crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            }
             return;
         }
         {
@@ -5747,6 +5971,14 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        crate::flip::window(|| {
+            let slots = [0, 1].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+            format!(
+                "ms {ms:.1} prep {cpu:.1} copies {copy_ms:.1} textures {texture_ms:.1} gpu {gpu:.1} back {back_ms:.1}                  heap {picked_ms:.1} draws {draws:.0} drop {dropped:.0} making {} queued {} frames {frames:.0}",
+                crate::pipeline::making(),
+                slots[0]
+            )
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
