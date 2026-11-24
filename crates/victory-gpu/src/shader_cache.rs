@@ -43,7 +43,12 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // Measuring several builds of one translator (`VICTORY_SHADER_KEY`,
+        // for example the git tree of victory-shader): they share entries.
+        let exe = match std::env::var("VICTORY_SHADER_KEY") {
+            Ok(key) if !key.is_empty() => Ok(key.into_bytes()),
+            _ => std::env::current_exe().and_then(std::fs::read),
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
