@@ -1320,18 +1320,18 @@ fn scratch_pool() -> bool {
 
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
-struct Spare<T> {
+pub(crate) struct Spare<T> {
     kept: Vec<(T, u64)>,
     bytes: u64,
 }
 
 impl<T> Spare<T> {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Spare { kept: Vec::new(), bytes: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
-    fn take(&mut self, size: u64) -> Option<T> {
+    pub(crate) fn take(&mut self, size: u64) -> Option<T> {
         let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
@@ -1346,6 +1346,24 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+
+    /// Keeps `thing` (`size` bytes) and returns what that takes the kept
+    /// bytes past `most` for, the oldest first (`thing` itself if it alone
+    /// is larger): sizes nobody asks for again do not stay.
+    pub(crate) fn give_for(&mut self, thing: T, size: u64, most: u64) -> Vec<T> {
+        if size > most {
+            return vec![thing];
+        }
+        let (mut went, mut bytes) = (0, self.bytes + size);
+        while bytes > most {
+            bytes -= self.kept[went].1;
+            went += 1;
+        }
+        self.bytes = bytes;
+        let old = self.kept.drain(..went).map(|(thing, _)| thing).collect();
+        self.kept.push((thing, size));
+        old
     }
 }
 
@@ -6425,6 +6443,21 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// The oldest things go for a new one, and one over the limit is not
+    /// kept at all.
+    #[test]
+    fn the_oldest_go_for_a_new_one() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert!(spare.give_for(1, 4, 10).is_empty());
+        assert!(spare.give_for(2, 4, 10).is_empty());
+        assert_eq!(spare.give_for(3, 11, 10), [3]);
+        assert_eq!(spare.give_for(4, 4, 10), [1]);
+        assert_eq!(spare.bytes, 8);
+        assert_eq!(spare.give_for(5, 10, 10), [2, 4]);
+        assert_eq!(spare.take(10), Some(5));
+        assert_eq!(spare.bytes, 0);
     }
 }
 

@@ -45,6 +45,10 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The buffer was another texture's ([`SPARE`]), whose texels it holds
+    /// until this one is detiled: zeroed by the first refresh that has
+    /// nothing to detile.
+    used_before: std::sync::atomic::AtomicBool,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -387,7 +391,40 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Lists that recorded an upload held it until they were reset, so
+        // the card is done with the buffer.
+        if pool() {
+            let buffer = (self.buffer.clone(), self.data as usize);
+            let went = SPARE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .give_for(buffer, self.bytes, SPARE_MOST);
+            // Freed outside the lock.
+            drop(went);
+        }
     }
+}
+
+/// Mapped staging buffers no texture has, kept for the next texture of
+/// their size. The pass over the heap stages some 200 textures a frame,
+/// each for one upload: making (and freeing) a committed buffer for each
+/// took about half a millisecond.
+/// `VICTORY_STAGING_POOL=0`: each texture's own, freed with it.
+static SPARE: Mutex<crate::host::Spare<(ID3D12Resource, usize)>> = Mutex::new(crate::host::Spare::new());
+/// The most bytes of them.
+const SPARE_MOST: u64 = 192 << 20;
+
+fn pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of the staging buffer made for a texture that needs `total`:
+/// whole 64 KiB (what a buffer takes anyway), and eighths of a power of two
+/// above 512 KiB, so that textures of nearly the same size share buffers.
+fn pool_size(total: u64) -> u64 {
+    let step = (total.max(1).next_power_of_two() / 16).max(64 << 10);
+    total.max(1).next_multiple_of(step)
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -612,6 +649,18 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        // Nothing detiled over another texture's texels: zeros, as a new
+        // buffer has (`detile` clears the mark, also under `last`).
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.used_before.load(Relaxed) {
+                let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+                if self.used_before.swap(false, Relaxed) {
+                    // SAFETY: the mapped staging buffer, written under `last`.
+                    unsafe { self.data.write_bytes(0, self.bytes as usize) };
+                }
+            }
+        }
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
@@ -773,6 +822,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        let used_before = self.used_before.swap(false, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -795,6 +845,11 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                if used_before {
+                    let from = footprint.Offset as usize;
+                    // SAFETY: from here on the buffer is still another texture's.
+                    unsafe { self.data.add(from).write_bytes(0, self.bytes as usize - from) };
+                }
                 return;
             }
         }
@@ -1025,7 +1080,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (mut spare, mut bytes) = (None, total);
+    if pool() {
+        bytes = pool_size(total);
+        spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(bytes);
+    }
+    let used_before = spare.is_some();
+    let (buffer, data) = match spare {
+        Some((buffer, data)) => (buffer, data as *mut u8),
+        None => host.upload_buffer(bytes)?,
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1034,7 +1098,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1044,7 +1108,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        bytes: total,
+        bytes,
+        used_before: std::sync::atomic::AtomicBool::new(used_before),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -1053,6 +1118,23 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::pool_size;
+
+    /// A staging buffer holds what its texture needs, is at most an eighth
+    /// larger past 512 KiB, and near sizes are one size.
+    #[test]
+    fn staging_sizes_hold_the_texture_and_are_few() {
+        for total in [0, 1, 65_536, 65_537, 600_000, 1 << 20, (1 << 20) + 1, 5_592_405, 22_369_621] {
+            let size = pool_size(total);
+            assert!(size >= total && size.is_multiple_of(64 << 10), "{total}");
+            assert!(size - total < (total / 8).max(64 << 10) + 1, "{total} {size}");
+        }
+        assert_eq!(pool_size(5_592_405), pool_size(5_600_000));
+    }
 }
 
 #[cfg(test)]
