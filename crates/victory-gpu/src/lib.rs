@@ -25,6 +25,8 @@ mod cardmeter;
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
