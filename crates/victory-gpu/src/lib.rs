@@ -47,6 +47,7 @@ pub mod frame;
 mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
+mod health;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]

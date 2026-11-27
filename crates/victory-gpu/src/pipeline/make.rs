@@ -155,6 +155,12 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+/// Whether `p` has no host pipeline yet because it is still being made
+/// (false once made or refused).
+pub(crate) fn being_made(p: &Pending) -> bool {
+    p.made.get().is_none()
+}
+
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
