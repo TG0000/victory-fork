@@ -10532,6 +10532,17 @@ impl Host {
                 });
             }
             p.meter.frame(p.hwnd);
+            // `VICTORY_FRAME_HEALTH`: this frame's row (nothing when off).
+            if crate::health::on() {
+                crate::health::presented(
+                    crate::frame::current(),
+                    crate::draw::drawn(),
+                    crate::draw::dispatched(),
+                    crate::draw::HEAP_TEXTURES_FULL.load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed)),
+                    self.video_memory().map(|[budget, used, ..]| (used, budget)),
+                );
+            }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
